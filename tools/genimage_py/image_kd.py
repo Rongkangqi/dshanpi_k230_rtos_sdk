@@ -30,6 +30,8 @@ MEDIUM_TYPE_SPI_NAND = 1
 MEDIUM_TYPE_SPI_NOR = 2
 
 KDIMG_CONTENT_START_OFFSET = 64 * 1024  # Image content start offset (64KB)
+KDIMG_DEFAULT_SPI_NAND_PAGE_SIZE = 2048
+KDIMG_DEFAULT_SPI_NOR_ERASE_SIZE = 64 * 1024
 
 KD_ALIGNMENT = 4096
 KD_PART_ENTRY_ALIGN = 256      # Partition entry alignment size in bytes
@@ -113,12 +115,107 @@ class KdImgPartRecord:
     image_file: str
     part: KdImgPart
 
+@dataclass
+class KdImgRegion:
+    """A range of a finished raw disk image to package as a KDIMG part"""
+    name: str
+    offset: int
+    size: int
+    max_size: int
+    erase_size: int = 0
+    flag: int = 0
+
+def write_kdimage_from_raw(raw_path: str, kd_path: str, regions: List[KdImgRegion],
+                           image_info: str, chip_info: str, board_info: str) -> None:
+    """Package regions of a finished MMC image as a KDIMG.
+
+    Payloads are read back from the raw image, so the KDIMG writes exactly the
+    bytes the raw image holds at each offset. Identical payloads, such as A/B
+    slots of the same firmware, share one copy of their content.
+
+    Each region is hashed and staged in one pass, trading temporary writes of
+    duplicate payloads for avoiding a second read of unique payloads.
+    """
+    if len(regions) * KD_PART_ENTRY_ALIGN > KDIMG_CONTENT_START_OFFSET - KD_HEADER_ALIGN:
+        raise ImageError(f"Too many partitions for a KDIMG partition table: {len(regions)}")
+
+    chunk_size = 4 * 1024 * 1024
+    output_dir = os.path.dirname(os.path.abspath(kd_path))
+    temp_path = None
+    parts: List[KdImgPart] = []
+    contents: Dict[Tuple[bytes, int], int] = {}
+    write_offset = KDIMG_CONTENT_START_OFFSET
+    try:
+        with open(raw_path, "rb") as raw, tempfile.NamedTemporaryFile(
+                dir=output_dir, prefix=".kdimg-", delete=False) as kd:
+            temp_path = kd.name
+            for region in sorted(regions, key=lambda r: r.offset):
+                digest = hashlib.sha256()
+                raw.seek(region.offset)
+                kd.seek(write_offset)
+                remaining = region.size
+                while remaining:
+                    # Ranges past the end of the raw file are unwritten zeros.
+                    chunk = raw.read(min(remaining, chunk_size)) or bytes(min(remaining, chunk_size))
+                    kd.write(chunk)
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+                sha256 = digest.digest()
+
+                content_offset = contents.get((sha256, region.size))
+                if content_offset is None:
+                    content_offset = contents[(sha256, region.size)] = write_offset
+                    write_offset += KdImageHandler.roundup(region.size, KD_ALIGNMENT)
+                else:
+                    logger.debug(f"Skipping duplicate part content: {region.name}")
+
+                parts.append(KdImgPart(
+                    part_offset=region.offset,
+                    part_size=region.size,
+                    part_erase_size=region.erase_size,
+                    part_max_size=region.max_size,
+                    part_flag=region.flag,
+                    part_name=region.name,
+                    part_content_offset=content_offset,
+                    part_content_size=region.size,
+                    part_content_sha256=sha256,
+                ))
+
+            part_table_data = b''.join(part.to_bytes() for part in parts)
+            header = KdImgHdr(
+                part_tbl_num=len(parts),
+                part_tbl_crc32=zlib.crc32(part_table_data) & 0xFFFFFFFF,
+                image_info=image_info,
+                chip_info=chip_info,
+                board_info=board_info,
+            )
+            header.img_hdr_crc32 = zlib.crc32(header.to_bytes()) & 0xFFFFFFFF
+
+            kd.seek(0)
+            kd.write(header.to_bytes())
+            kd.seek(KD_HEADER_ALIGN)
+            kd.write(part_table_data)
+            kd.truncate(write_offset)
+        # NamedTemporaryFile is private; give the image the usual permissions.
+        umask = os.umask(0)
+        os.umask(umask)
+        os.chmod(temp_path, 0o666 & ~umask)
+        os.replace(temp_path, kd_path)
+        temp_path = None
+    except OSError as error:
+        raise ImageError(f"Failed to generate KDIMG {kd_path}: {error}") from error
+    finally:
+        if temp_path is not None:
+            os.unlink(temp_path)
+
+    logger.info(f"Successfully generated image {kd_path}, size {format_size(write_offset)}")
+
 class KdImageHandler(ComImageHandler):
     """KD Image Handler"""
     type = "kdimage"
     opts = [
         "image-info", "chip-info", "board-info",
-        "part-flag", "medium-type"
+        "part-flag", "medium-type", "spi-nor-erase-size", "raw-image"
     ]
 
     def __init__(self):
@@ -129,6 +226,9 @@ class KdImageHandler(ComImageHandler):
 
         self.header: KdImgHdr = KdImgHdr()
         self.medium_type: str = "mmc"
+        self.spi_nand_page_size: int = KDIMG_DEFAULT_SPI_NAND_PAGE_SIZE
+        self.spi_nor_erase_size: int = KDIMG_DEFAULT_SPI_NOR_ERASE_SIZE
+        self.raw_image: Optional[str] = None
 
         self.part_records: List[KdImgPartRecord] = []
 
@@ -150,6 +250,7 @@ class KdImageHandler(ComImageHandler):
 
         self._parse_config_parameters()
         self._validate_config()
+        self._setup_spi_nand_page_size(image)
         super().validate_config_parameters()
 
         if self.table_type & TYPE_GPT:
@@ -165,10 +266,16 @@ class KdImageHandler(ComImageHandler):
             super().check_overlap(image, part)
 
         super()._validate_mbr_partition_count(image)
+        self._validate_raw_image(image)
 
     def _parse_config_parameters(self) -> None:
         """Parse configuration parameters to private data structure"""
         super()._parse_config_parameters()
+
+        self.medium_type = self.config.get("medium-type", self.medium_type)
+        self.spi_nor_erase_size = self._parse_size(
+            self.config.get("spi-nor-erase-size", KDIMG_DEFAULT_SPI_NOR_ERASE_SIZE))
+        self.raw_image = self.config.get("raw-image")
 
         self.header.image_info = self.config.get("image_info", "")
         if '' == self.header.image_info:
@@ -196,8 +303,20 @@ class KdImageHandler(ComImageHandler):
             self.medium_type = MEDIUM_TYPE_SPI_NAND
         elif table_type == "spi_nor":
             self.medium_type = MEDIUM_TYPE_SPI_NOR
+            if (self.spi_nor_erase_size < 4096 or
+                    self.spi_nor_erase_size & (self.spi_nor_erase_size - 1)):
+                raise ImageError("SPI NOR erase size must be a power of two, at least 4096 bytes")
         else:
             raise ValueError(f"'{table_type}' is not a valid medium-type")
+
+    def _setup_spi_nand_page_size(self, image: Image) -> None:
+        flash_type = getattr(image, "flash_type", None)
+        if not flash_type:
+            return
+
+        page_size = safe_to_int(getattr(flash_type, "page_size", 0))
+        if page_size > 0:
+            self.spi_nand_page_size = page_size
 
     def _add_virtual_partitions(self, image: Image) -> None:
         """Add virtual partitions related to the partition table"""
@@ -240,6 +359,27 @@ class KdImageHandler(ComImageHandler):
         # Handle TOC
         super().setup_toc(image, "[TOC]")
 
+        if self.toc_enable:
+            for part in image.partitions:
+                if part.name == "[TOC]":
+                    if (self.medium_type == MEDIUM_TYPE_SPI_NOR and
+                            part.offset % self.spi_nor_erase_size):
+                        raise ImageError("SPI NOR TOC offset must be erase-block aligned")
+                    part.size = self._normalize_toc_size(part.size)
+                    break
+
+    def _normalize_toc_size(self, toc_size: int) -> int:
+        toc_size = max(toc_size, 64)
+
+        if self.medium_type == MEDIUM_TYPE_SPI_NAND:
+            toc_size = max(toc_size, self.spi_nand_page_size)
+        elif self.medium_type == MEDIUM_TYPE_SPI_NOR:
+            # kburn bounds the rounded erase against part_max_size. Reserve
+            # the whole sector even when the TOC entries occupy only 512 B.
+            toc_size = self.roundup(toc_size, self.spi_nor_erase_size)
+
+        return toc_size
+
     def _setup_part_image(self, image: Image, part: Partition) -> None:
         """Setup partition image"""
         if not part.image:
@@ -263,6 +403,64 @@ class KdImageHandler(ComImageHandler):
         super().generate(image)
         prepare_image(image, self.file_size)
         self._write_partition_data(image)
+        if self.raw_image:
+            self._write_raw_image(image)
+
+    def _validate_raw_image(self, image: Image) -> None:
+        if not self.raw_image:
+            return
+        if self.medium_type != MEDIUM_TYPE_SPI_NOR:
+            raise ImageError("raw-image is only supported for SPI NOR")
+        if not image.size or image.size <= 0 or image.size % self.spi_nor_erase_size:
+            raise ImageError("raw-image requires an erase-aligned flash size")
+        if (os.path.basename(self.raw_image) != self.raw_image or
+                self.raw_image in (".", "..", os.path.basename(image.outfile))):
+            raise ImageError("raw-image must be a separate filename in the output directory")
+        for part in image.partitions:
+            if part.offset < 0 or part.size <= 0 or part.offset + part.size > image.size:
+                raise ImageError(f"Partition {part.name} exceeds raw-image flash size")
+            if part.flag:
+                raise ImageError("raw-image does not support special partition write flags")
+
+    def _write_raw_image(self, image: Image) -> None:
+        """Expand KDIMG payloads to physical flash offsets, including duplicates."""
+        output_dir = os.path.dirname(os.path.abspath(image.outfile))
+        output_path = os.path.join(output_dir, self.raw_image)
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=output_dir, prefix=".spinor-",
+                                             delete=False) as raw, open(image.outfile, "rb") as kd:
+                temp_path = raw.name
+                erased = b"\xff" * (1024 * 1024)
+                remaining = image.size
+                while remaining:
+                    chunk = min(remaining, len(erased))
+                    raw.write(erased[:chunk])
+                    remaining -= chunk
+
+                for record in self.part_records:
+                    part = record.part
+                    if (part.part_content_size > part.part_max_size or
+                            part.part_offset + part.part_content_size > image.size):
+                        raise ImageError(f"Payload {part.part_name} exceeds raw-image partition")
+                    kd.seek(part.part_content_offset)
+                    raw.seek(part.part_offset)
+                    remaining = part.part_content_size
+                    while remaining:
+                        chunk = kd.read(min(remaining, len(erased)))
+                        if not chunk:
+                            raise ImageError(f"Truncated KDIMG payload: {part.part_name}")
+                        raw.write(chunk)
+                        remaining -= len(chunk)
+            os.replace(temp_path, output_path)
+            temp_path = None
+        except OSError as error:
+            raise ImageError(f"Failed to generate raw-image: {error}") from error
+        finally:
+            if temp_path is not None:
+                os.unlink(temp_path)
+        logger.info("Generated SPI NOR factory image %s, size %s",
+                    output_path, format_size(image.size))
 
     def _calculate_sha256(self, filename: str, offset: int, size: int) -> bytes:
         """Calculate the SHA256 of the specified region of the file"""
@@ -382,15 +580,12 @@ class KdImageHandler(ComImageHandler):
             # Offset alignment
             image_write_offset += super().roundup(aligned_child_size, 4096)
 
-            self.header.part_tbl_num = len([p for p in image.partitions])
-            # print(f"tbl_num: {self.header.part_tbl_num} idx: {part_idx}")
-            if part_idx > self.header.part_tbl_num:
-                raise ValueError("Image partition count does not match")
-
         self._generate_final_stage(image, image_write_offset)
 
     def _generate_final_stage(self, image, image_write_offset):
         # Final stage of image generation
+        self.header.part_tbl_num = len(self.part_records)
+
         part_table_data = b''
         for part in self.part_records:
             # print(f"kdimgpart: {part}")
@@ -466,7 +661,7 @@ class KdImageHandler(ComImageHandler):
     def _generate_toc_partition(self, image: Image) -> Image:
         """Generate TOC partition"""
         # Even if there are no entries, generate a minimal TOC partition
-        toc_size = max(64, self.toc_num * 64)
+        toc_size = self._normalize_toc_size(self.toc_num * 64)
 
         if not self.toc_num:
             # Create empty TOC partition (unchanged)
